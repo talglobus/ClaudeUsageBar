@@ -1,8 +1,8 @@
 import SwiftUI
 import AppKit
-import WebKit
 import Carbon
 import Security
+import ServiceManagement
 
 /**
  * Stores the claude.ai session cookie in the Keychain instead of UserDefaults.
@@ -82,6 +82,38 @@ enum KeychainHelper {
     }
 }
 
+/**
+ * Registers the app as a macOS login item via SMAppService (macOS 13+).
+ * On older systems this is a no-op (the legacy login-item API needs a separate
+ * helper bundle this single-binary app doesn't ship), so the toggle simply
+ * won't take effect there.
+ */
+enum LoginItem {
+    static var isEnabled: Bool {
+        guard #available(macOS 13.0, *) else { return false }
+        return SMAppService.mainApp.status == .enabled
+    }
+
+    @discardableResult
+    static func setEnabled(_ enabled: Bool) -> Bool {
+        guard #available(macOS 13.0, *) else {
+            NSLog("ClaudeUsage: Open-at-Login needs macOS 13+; ignoring toggle")
+            return false
+        }
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            return true
+        } catch {
+            NSLog("ClaudeUsage: Open-at-Login \(enabled ? "register" : "unregister") failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+}
+
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -138,6 +170,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.statusManager.fetch()
         }
 
+        /**
+         * Foundation timers pause while the Mac sleeps and don't catch up missed
+         * ticks on wake, so the menu bar can show pre-sleep data for up to 5 min
+         * after resume. Refetch immediately on wake.
+         */
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.usageManager.fetchUsage()
+            self?.statusManager.fetch()
+        }
+
+        // Re-render the menu bar title each minute so the optional session countdown
+        // stays current (no network call — only redraws from already-fetched data).
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            if self.usageManager.showSessionTimeInMenuBar {
+                self.usageManager.updateStatusBar()
+            }
+        }
+
         // App updates are infrequent (new release at most weekly) — poll every 3 hours.
         Timer.scheduledTimer(withTimeInterval: 3 * 3600, repeats: true) { _ in
             self.updateManager.fetch()
@@ -148,10 +202,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupKeyboardShortcut() {
-        // Check Accessibility permissions
-        checkAccessibilityPermissions()
-
-        // Only register if user has the shortcut enabled
+        // RegisterEventHotKey is an app-scoped Carbon hotkey — it needs no
+        // Accessibility permission. Register only if the user enabled the shortcut.
         if usageManager.shortcutEnabled {
             registerGlobalHotKey()
         }
@@ -162,32 +214,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             registerGlobalHotKey()
         } else {
             unregisterGlobalHotKey()
-        }
-    }
-
-    func checkAccessibilityPermissions() {
-        // Check if app has Accessibility permissions
-        let trusted = AXIsProcessTrusted()
-
-        if !trusted {
-            NSLog("⚠️ Accessibility permissions not granted")
-            // Show alert to guide user
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                let alert = NSAlert()
-                alert.messageText = "Accessibility Permission Required"
-                alert.informativeText = "ClaudeUsageBar needs Accessibility permission to use the Cmd+U keyboard shortcut.\n\nPlease enable it in:\nSystem Settings → Privacy & Security → Accessibility"
-                alert.alertStyle = .informational
-                alert.addButton(withTitle: "Open System Settings")
-                alert.addButton(withTitle: "Skip for Now")
-
-                let response = alert.runModal()
-                if response == .alertFirstButtonReturn {
-                    // Open System Settings
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                }
-            }
-        } else {
-            NSLog("✅ Accessibility permissions granted")
         }
     }
 
@@ -309,7 +335,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func updateStatusIcon(percentage: Int) {
+    func updateStatusIcon(percentage: Int, timeRemaining: String? = nil) {
         guard let button = statusItem.button else { return }
 
         // Determine color based on percentage
@@ -327,7 +353,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set image and title
         button.image = sparkIcon
-        button.title = " \(percentage)%"
+        if let timeRemaining = timeRemaining {
+            button.title = " \(percentage)% · \(timeRemaining)"
+        } else {
+            button.title = " \(percentage)%"
+        }
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -366,19 +396,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// NSColor extension for hex conversion
-extension NSColor {
-    var hexString: String {
-        guard let rgbColor = self.usingColorSpace(.deviceRGB) else {
-            return "#000000"
-        }
-        let r = Int(rgbColor.redComponent * 255)
-        let g = Int(rgbColor.greenComponent * 255)
-        let b = Int(rgbColor.blueComponent * 255)
-        return String(format: "#%02X%02X%02X", r, g, b)
-    }
-}
-
 // Main entry point
 @main
 struct Main {
@@ -398,9 +415,12 @@ class UsageManager: ObservableObject {
     @Published var weeklyLimit: Int = 100
     @Published var weeklySonnetUsage: Int = 0
     @Published var weeklySonnetLimit: Int = 100
+    @Published var weeklyDesignUsage: Int = 0
+    @Published var weeklyDesignLimit: Int = 100
     @Published var sessionResetsAt: Date?
     @Published var weeklyResetsAt: Date?
     @Published var weeklySonnetResetsAt: Date?
+    @Published var weeklyDesignResetsAt: Date?
     @Published var lastUpdated: Date = Date()
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
@@ -408,9 +428,11 @@ class UsageManager: ObservableObject {
     @Published var statusNotificationsEnabled: Bool = true
     @Published var openAtLogin: Bool = false
     @Published var hasWeeklySonnet: Bool = false
+    @Published var hasWeeklyDesign: Bool = false
     @Published var hasFetchedData: Bool = false
-    @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
+    @Published var showSessionTimeInMenuBar: Bool = false
+    @Published var organizationId: String = ""
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -421,12 +443,22 @@ class UsageManager: ObservableObject {
         self.statusItem = statusItem
         self.delegate = delegate
         loadSessionCookie()
+        loadOrganizationId()
         loadSettings()
-        checkAccessibilityStatus()
     }
 
-    func checkAccessibilityStatus() {
-        isAccessibilityEnabled = AXIsProcessTrusted()
+    func loadOrganizationId() {
+        organizationId = UserDefaults.standard.string(forKey: "claude_org_id") ?? ""
+    }
+
+    func saveOrganizationId(_ orgId: String) {
+        let trimmed = orgId.trimmingCharacters(in: .whitespacesAndNewlines)
+        organizationId = trimmed
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: "claude_org_id")
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: "claude_org_id")
+        }
     }
 
     func loadSessionCookie() {
@@ -473,7 +505,8 @@ class UsageManager: ObservableObject {
             statusNotificationsEnabled = UserDefaults.standard.bool(forKey: "status_notifications_enabled")
         }
 
-        openAtLogin = UserDefaults.standard.bool(forKey: "open_at_login")
+        // Reflect the actual login-item registration, not a stored flag.
+        openAtLogin = LoginItem.isEnabled
         lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
@@ -481,13 +514,14 @@ class UsageManager: ObservableObject {
         } else {
             shortcutEnabled = UserDefaults.standard.bool(forKey: "shortcut_enabled")
         }
+        showSessionTimeInMenuBar = UserDefaults.standard.bool(forKey: "show_session_time_in_menubar")
     }
 
     func saveSettings() {
         UserDefaults.standard.set(usageNotificationsEnabled,  forKey: "usage_notifications_enabled")
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
-        UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
+        UserDefaults.standard.set(showSessionTimeInMenuBar, forKey: "show_session_time_in_menubar")
         UserDefaults.standard.synchronize()
     }
 
@@ -504,19 +538,24 @@ class UsageManager: ObservableObject {
     func clearSessionCookie() {
         NSLog("ClaudeUsage: Clearing cookie")
         sessionCookie = ""
+        organizationId = ""
         KeychainHelper.delete(forKey: "session_cookie")
         // Defensive: wipe any plaintext copy a pre-migration build may have left behind.
         UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
+        UserDefaults.standard.removeObject(forKey: "claude_org_id")
 
         // Reset all data
         sessionUsage = 0
         weeklyUsage = 0
         weeklySonnetUsage = 0
+        weeklyDesignUsage = 0
         sessionResetsAt = nil
         weeklyResetsAt = nil
         weeklySonnetResetsAt = nil
+        weeklyDesignResetsAt = nil
         hasFetchedData = false
         hasWeeklySonnet = false
+        hasWeeklyDesign = false
         errorMessage = nil
         lastNotifiedThreshold = 0
         UserDefaults.standard.set(0, forKey: "last_notified_threshold")
@@ -534,7 +573,7 @@ class UsageManager: ObservableObject {
             let trimmed = part.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("lastActiveOrg=") {
                 let orgId = trimmed.replacingOccurrences(of: "lastActiveOrg=", with: "")
-                NSLog("📋 Found org ID in cookie: \(orgId)")
+                NSLog("📋 Found org ID in cookie")
                 completion(orgId)
                 return
             }
@@ -548,7 +587,8 @@ class UsageManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("sessionKey=\(sessionCookie)", forHTTPHeaderField: "Cookie")
+        // Send the full cookie string the user provided (not just sessionKey).
+        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
@@ -561,7 +601,7 @@ class UsageManager: ObservableObject {
                 completion(nil)
                 return
             }
-            NSLog("✅ Got org ID from bootstrap: \(lastActiveOrgId)")
+            NSLog("✅ Got org ID from bootstrap")
             completion(lastActiveOrgId)
         }.resume()
     }
@@ -578,11 +618,17 @@ class UsageManager: ObservableObject {
         isLoading = true
         errorMessage = nil
 
-        // Extract org ID from cookie
+        // A manually-set org ID (from the cookie panel) wins; otherwise auto-detect.
+        let manualOrgId = organizationId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !manualOrgId.isEmpty {
+            fetchUsageWithOrgId(manualOrgId)
+            return
+        }
+
         fetchOrganizationId { [weak self] orgId in
             guard let self = self, let orgId = orgId else {
                 DispatchQueue.main.async {
-                    self?.errorMessage = "Could not get org ID from cookie"
+                    self?.errorMessage = "Could not auto-detect org ID — set it manually in the cookie panel"
                     self?.isLoading = false
                 }
                 return
@@ -635,10 +681,6 @@ class UsageManager: ObservableObject {
                 }
 
                 NSLog("📡 Status: \(httpResponse.statusCode)")
-
-                if let data = data, let responseString = String(data: data, encoding: .utf8) {
-                    NSLog("📦 Response: \(responseString)")
-                }
 
                 if httpResponse.statusCode == 200, let data = data {
                     self?.parseUsageData(data)
@@ -716,8 +758,30 @@ class UsageManager: ObservableObject {
                 hasWeeklySonnet = false
             }
 
+            /**
+             * Claude Design usage, surfaced by the API as the `seven_day_omelette`
+             * bucket. Plan-dependent and tracked in its own weekly window; absent
+             * for accounts without Claude Design, so the UI hides it when missing.
+             */
+            if let sevenDayDesign = json["seven_day_omelette"] as? [String: Any] {
+                hasWeeklyDesign = true
+                if let designUtil = sevenDayDesign["utilization"] as? Double {
+                    weeklyDesignUsage = Int(designUtil)
+                    weeklyDesignLimit = 100
+                }
+                if let resetsAtString = sevenDayDesign["resets_at"] as? String,
+                   let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                    weeklyDesignResetsAt = resetsAt
+                } else {
+                    // resets_at is null until first Claude Design use — keep nil
+                    weeklyDesignResetsAt = nil
+                }
+            } else {
+                hasWeeklyDesign = false
+            }
+
             // Log what we found
-            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")")
+            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")\(hasWeeklyDesign ? ", Weekly Design \(weeklyDesignUsage)%" : "")")
 
             lastUpdated = Date()
             errorMessage = nil
@@ -732,13 +796,30 @@ class UsageManager: ObservableObject {
     }
 
     func updateStatusBar() {
-        let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        // The API returns `utilization` already as a 0–100 percentage.
+        let sessionPercent = sessionUsage
 
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        // Update the icon color (and optionally the time until the session resets).
+        let timeRemaining = showSessionTimeInMenuBar ? formatTimeUntilReset(sessionResetsAt) : nil
+        delegate?.updateStatusIcon(percentage: sessionPercent, timeRemaining: timeRemaining)
 
         // Check for notification thresholds
         checkNotificationThresholds(percentage: sessionPercent)
+    }
+
+    private func formatTimeUntilReset(_ resetsAt: Date?) -> String? {
+        guard let resetsAt = resetsAt else { return nil }
+        let seconds = Int(resetsAt.timeIntervalSinceNow)
+        guard seconds > 0 else { return nil }
+        let hours = seconds / 3600
+        let minutes = (seconds % 3600) / 60
+        if hours > 0 {
+            return "\(hours)h\(String(format: "%02d", minutes))"
+        } else if minutes > 0 {
+            return "\(minutes)m"
+        } else {
+            return "<1m"
+        }
     }
 
     func checkNotificationThresholds(percentage: Int) {
@@ -772,6 +853,11 @@ class UsageManager: ObservableObject {
         }
     }
 
+    /**
+     * Uses the deprecated NSUserNotification on purpose: it delivers without an
+     * authorization prompt for ad-hoc/from-source builds, whereas UNUserNotification
+     * needs a properly signed, registered bundle. Revisit if this ships notarized.
+     */
     func sendNotification(percentage: Int, threshold: Int) {
         let notification = NSUserNotification()
         notification.title = "Claude Usage Alert"
@@ -797,11 +883,13 @@ class UsageManager: ObservableObject {
     @Published var sessionPercentage: Double = 0.0
     @Published var weeklyPercentage: Double = 0.0
     @Published var weeklySonnetPercentage: Double = 0.0
+    @Published var weeklyDesignPercentage: Double = 0.0
 
     func updatePercentages() {
         sessionPercentage = Double(sessionUsage) / Double(sessionLimit)
         weeklyPercentage = Double(weeklyUsage) / Double(weeklyLimit)
         weeklySonnetPercentage = Double(weeklySonnetUsage) / Double(weeklySonnetLimit)
+        weeklyDesignPercentage = Double(weeklyDesignUsage) / Double(weeklyDesignLimit)
     }
 }
 
@@ -1042,15 +1130,18 @@ class UpdateManager: ObservableObject {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
     }
 
-    private static let allowedHostSuffixes = [
-        "github.com",
-        "claudeusagebar.com"
-    ]
-
+    /**
+     * The update banner can only open links to the project's own site or its
+     * exact GitHub repo. Allowing any github.com URL would let a tampered
+     * manifest point users at an attacker-controlled repo's releases.
+     */
     static func isSafeURL(_ url: URL) -> Bool {
-        guard url.scheme == "https" else { return false }
-        guard let host = url.host?.lowercased() else { return false }
-        return allowedHostSuffixes.contains(where: { host == $0 || host.hasSuffix("." + $0) })
+        guard url.scheme == "https", let host = url.host?.lowercased() else { return false }
+        if host == "claudeusagebar.com" || host.hasSuffix(".claudeusagebar.com") { return true }
+        if host == "github.com" || host == "www.github.com" {
+            return url.path.hasPrefix("/Artzainnn/ClaudeUsageBar")
+        }
+        return false
     }
 
     private static func parseButtons(from json: [String: Any]) -> [BannerButton] {
@@ -1154,6 +1245,12 @@ class CustomTextField: NSTextField {
     var onTextChange: ((String) -> Void)?
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Only handle shortcuts when THIS field is being edited; otherwise the
+        // event must continue down the responder chain so other focused fields
+        // (e.g. the cookie text view) can handle it themselves.
+        guard self.currentEditor() != nil else {
+            return super.performKeyEquivalent(with: event)
+        }
         if event.type == .keyDown {
             if (event.modifierFlags.contains(.command)) {
                 switch event.charactersIgnoringModifiers {
@@ -1194,6 +1291,10 @@ class CustomTextField: NSTextField {
 // Custom TextView that ensures keyboard commands work
 class PasteableNSTextView: NSTextView {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Only handle shortcuts when this text view is the first responder.
+        guard self.window?.firstResponder === self else {
+            return super.performKeyEquivalent(with: event)
+        }
         if event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers {
             case "v": // Paste
@@ -1282,6 +1383,57 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
+/**
+ * Single-line text field with proper Cmd+V/C/X/A support. Stock SwiftUI
+ * TextField doesn't get these in an LSUIElement app because there's no main-menu
+ * Edit > Paste item to bind the shortcuts to.
+ */
+struct PasteableSingleLineTextField: NSViewRepresentable {
+    @Binding var text: String
+    var placeholder: String
+
+    func makeNSView(context: Context) -> CustomTextField {
+        let field = CustomTextField()
+        field.placeholderString = placeholder
+        field.isBordered = true
+        field.bezelStyle = .roundedBezel
+        field.isEditable = true
+        field.isSelectable = true
+        field.usesSingleLineMode = true
+        field.cell?.wraps = false
+        field.cell?.isScrollable = true
+        field.font = NSFont.systemFont(ofSize: 11)
+        field.delegate = context.coordinator
+        field.onTextChange = { newValue in
+            // Drive the SwiftUI binding when the paste handler mutates stringValue directly.
+            context.coordinator.pushToBinding(newValue)
+        }
+        return field
+    }
+
+    func updateNSView(_ nsView: CustomTextField, context: Context) {
+        if nsView.stringValue != text {
+            nsView.stringValue = text
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: PasteableSingleLineTextField
+        init(_ parent: PasteableSingleLineTextField) { self.parent = parent }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func pushToBinding(_ value: String) {
+            DispatchQueue.main.async { self.parent.text = value }
+        }
+    }
+}
+
 private struct ContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -1294,6 +1446,7 @@ struct UsageView: View {
     @ObservedObject var statusManager: StatusManager
     @ObservedObject var updateManager: UpdateManager
     @State private var sessionCookieInput: String = ""
+    @State private var orgIdInput: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
@@ -1321,6 +1474,7 @@ struct UsageView: View {
                 if let hint = usageManager.cookieHint {
                     sessionCookieInput = hint
                 }
+                orgIdInput = usageManager.organizationId
                 usageManager.updatePercentages()
             }
             .onChange(of: showingSettings) { isOpen in
@@ -1452,6 +1606,33 @@ struct UsageView: View {
                         .tint(colorForPercentage(usageManager.weeklySonnetPercentage))
 
                     Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            // Claude Design Usage (only show if available — plan-dependent)
+            if usageManager.hasWeeklyDesign && usageManager.hasFetchedData {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Claude Design (7 day)")
+                            .font(.subheadline)
+                        Spacer()
+                        if let resetTime = usageManager.weeklyDesignResetsAt {
+                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text("Not started yet")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    ProgressView(value: usageManager.weeklyDesignPercentage)
+                        .tint(colorForPercentage(usageManager.weeklyDesignPercentage))
+
+                    Text("\(Int(usageManager.weeklyDesignPercentage * 100))% used")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -1635,9 +1816,18 @@ struct UsageView: View {
                         Text("4. Refresh page, click 'usage' request")
                         Text("5. Find 'Cookie' in Request Headers")
                         Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
+                        Text("7. Org ID is auto-detected; override below only if\n   auto-detect fails (UUID in /organizations/<id>/usage)")
                     }
                     .font(.caption2)
                     .foregroundColor(.secondary)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Organization ID (optional — leave blank to auto-detect):")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        PasteableSingleLineTextField(text: $orgIdInput, placeholder: "e.g. 1a2b3c4d-5e6f-7890-abcd-ef1234567890")
+                            .frame(height: 22)
+                    }
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Paste full cookie string:")
@@ -1649,22 +1839,26 @@ struct UsageView: View {
                                 .cornerRadius(4)
 
                             HStack(spacing: 8) {
-                                Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
+                                Button("Save & Fetch") {
+                                    let trimmedOrg = orgIdInput.trimmingCharacters(in: .whitespacesAndNewlines)
                                     if sessionCookieInput.isEmpty {
                                         usageManager.errorMessage = "Cookie field is empty!"
                                     } else {
                                         usageManager.saveSessionCookie(sessionCookieInput)
+                                        usageManager.saveOrganizationId(trimmedOrg) // empty = auto-detect
                                         usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
+                                        usageManager.errorMessage = trimmedOrg.isEmpty
+                                            ? "Saved, auto-detecting org ID..."
+                                            : "Saved, fetching..."
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
 
                                 if usageManager.hasFetchedData {
-                                    Button("Clear Cookie") {
+                                    Button("Clear") {
                                         sessionCookieInput = ""
+                                        orgIdInput = ""
                                         usageManager.clearSessionCookie()
                                     }
                                     .buttonStyle(.bordered)
@@ -1704,8 +1898,9 @@ struct UsageView: View {
                     Toggle(isOn: Binding(
                         get: { usageManager.openAtLogin },
                         set: { newValue in
-                            usageManager.openAtLogin = newValue
-                            usageManager.saveSettings()
+                            LoginItem.setEnabled(newValue)
+                            // Reflect what actually registered (may differ if it failed).
+                            usageManager.openAtLogin = LoginItem.isEnabled
                         }
                     )) {
                         VStack(alignment: .leading, spacing: 2) {
@@ -1714,6 +1909,25 @@ struct UsageView: View {
                             Text("Launch app automatically when you log in")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+
+                    Toggle(isOn: Binding(
+                        get: { usageManager.showSessionTimeInMenuBar },
+                        set: { newValue in
+                            usageManager.showSessionTimeInMenuBar = newValue
+                            usageManager.saveSettings()
+                            usageManager.updateStatusBar()
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Show Session Time in Menu Bar")
+                                .font(.caption)
+                            Text("Display time remaining until the 5-hour session resets, next to the usage percentage")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                     .toggleStyle(.checkbox)
@@ -1785,19 +1999,6 @@ struct UsageView: View {
                             }
                         }
                         .toggleStyle(.switch)
-
-                        if usageManager.shortcutEnabled && !usageManager.isAccessibilityEnabled {
-                            Button("Grant Accessibility Permission") {
-                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-
-                            Text("Accessibility permission may be needed\nfor the shortcut to work in all apps")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
                     }
 
                     Divider()

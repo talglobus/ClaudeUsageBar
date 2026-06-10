@@ -114,6 +114,42 @@ enum LoginItem {
     }
 }
 
+/**
+ * URLSession for the credential-bearing claude.ai requests. Foundation forwards a
+ * manually-set `Cookie` header across redirects (including cross-host ones), so a
+ * compromised claude.ai response that 302'd elsewhere could carry the session
+ * cookie off-host. This session disables automatic cookie handling and strips
+ * `Cookie`/`Authorization` on any redirect that changes host.
+ */
+final class CredentialSession: NSObject, URLSessionTaskDelegate {
+    static let shared = CredentialSession()
+
+    private(set) lazy var session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }()
+
+    func urlSession(_ session: URLSession,
+                    task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        let originalHost = task.originalRequest?.url?.host?.lowercased()
+        let newHost = request.url?.host?.lowercased()
+        guard originalHost == newHost else {
+            var stripped = request
+            stripped.setValue(nil, forHTTPHeaderField: "Cookie")
+            stripped.setValue(nil, forHTTPHeaderField: "Authorization")
+            NSLog("⚠️ Stripped credentials on cross-host redirect to \(newHost ?? "?")")
+            completionHandler(stripped)
+            return
+        }
+        completionHandler(request)
+    }
+}
+
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -592,7 +628,7 @@ class UsageManager: ObservableObject {
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        CredentialSession.shared.session.dataTask(with: request) { data, response, error in
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let account = json["account"] as? [String: Any],
@@ -664,7 +700,7 @@ class UsageManager: ObservableObject {
 
         NSLog("🔍 Fetching from: \(urlString)")
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        CredentialSession.shared.session.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 self?.isLoading = false
 

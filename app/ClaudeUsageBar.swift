@@ -619,8 +619,9 @@ class UsageManager: ObservableObject {
         errorMessage = nil
 
         // A manually-set org ID (from the cookie panel) wins; otherwise auto-detect.
+        // Require UUID form so a stray value can't inject path/query into the request URL.
         let manualOrgId = organizationId.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !manualOrgId.isEmpty {
+        if !manualOrgId.isEmpty, UUID(uuidString: manualOrgId) != nil {
             fetchUsageWithOrgId(manualOrgId)
             return
         }
@@ -1139,7 +1140,8 @@ class UpdateManager: ObservableObject {
         guard url.scheme == "https", let host = url.host?.lowercased() else { return false }
         if host == "claudeusagebar.com" || host.hasSuffix(".claudeusagebar.com") { return true }
         if host == "github.com" || host == "www.github.com" {
-            return url.path.hasPrefix("/Artzainnn/ClaudeUsageBar")
+            let repo = "/Artzainnn/ClaudeUsageBar"
+            return url.path == repo || url.path.hasPrefix(repo + "/")
         }
         return false
     }
@@ -1843,6 +1845,8 @@ struct UsageView: View {
                                     let trimmedOrg = orgIdInput.trimmingCharacters(in: .whitespacesAndNewlines)
                                     if sessionCookieInput.isEmpty {
                                         usageManager.errorMessage = "Cookie field is empty!"
+                                    } else if !trimmedOrg.isEmpty && UUID(uuidString: trimmedOrg) == nil {
+                                        usageManager.errorMessage = "Invalid Organization ID — must be a UUID"
                                     } else {
                                         usageManager.saveSessionCookie(sessionCookieInput)
                                         usageManager.saveOrganizationId(trimmedOrg) // empty = auto-detect

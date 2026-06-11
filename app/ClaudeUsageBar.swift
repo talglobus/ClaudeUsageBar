@@ -150,6 +150,17 @@ final class CredentialSession: NSObject, URLSessionTaskDelegate {
     }
 }
 
+/**
+ * Whether a claude.ai response means the session is dead: HTTP 401/403, or a
+ * 200 bootstrap whose `account` came back null. Strong signals only — transient
+ * errors (network failure, 5xx) are not treated as expiry. Pure for testing.
+ */
+func sessionLooksExpired(status: Int, accountIsNull: Bool) -> Bool {
+    if status == 401 || status == 403 { return true }
+    if status == 200 && accountIsNull { return true }
+    return false
+}
+
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -460,6 +471,7 @@ class UsageManager: ObservableObject {
     @Published var lastUpdated: Date = Date()
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
+    @Published var sessionExpired: Bool = false
     @Published var usageNotificationsEnabled: Bool = true
     @Published var statusNotificationsEnabled: Bool = true
     @Published var openAtLogin: Bool = false
@@ -564,6 +576,7 @@ class UsageManager: ObservableObject {
     func saveSessionCookie(_ cookie: String) {
         NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
         sessionCookie = cookie
+        sessionExpired = false
         if KeychainHelper.save(cookie, forKey: "session_cookie") {
             NSLog("ClaudeUsage: Cookie saved to Keychain successfully")
         } else {
@@ -602,6 +615,15 @@ class UsageManager: ObservableObject {
         NSLog("ClaudeUsage: Cookie cleared, data reset")
     }
 
+    /** Flags an expired/invalid session: clear message + a flag the UI uses to open the cookie panel. */
+    func markSessionExpired() {
+        DispatchQueue.main.async {
+            self.errorMessage = "Session expired — paste a fresh cookie"
+            self.sessionExpired = true
+            self.isLoading = false
+        }
+    }
+
     func fetchOrganizationId(completion: @escaping (String?) -> Void) {
         // Get org ID from the lastActiveOrg cookie value
         let cookieParts = sessionCookie.components(separatedBy: ";")
@@ -628,10 +650,16 @@ class UsageManager: ObservableObject {
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
-        CredentialSession.shared.session.dataTask(with: request) { data, response, error in
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let account = json["account"] as? [String: Any],
+        CredentialSession.shared.session.dataTask(with: request) { [weak self] data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let json = (data.flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any]
+            // Dead session: 401/403, or a 200 bootstrap whose account is null.
+            if sessionLooksExpired(status: status, accountIsNull: json?["account"] is NSNull) {
+                self?.markSessionExpired()
+                completion(nil)
+                return
+            }
+            guard let account = json?["account"] as? [String: Any],
                   let lastActiveOrgId = account["lastActiveOrgId"] as? String else {
                 NSLog("❌ Could not parse org ID from bootstrap")
                 completion(nil)
@@ -665,7 +693,10 @@ class UsageManager: ObservableObject {
         fetchOrganizationId { [weak self] orgId in
             guard let self = self, let orgId = orgId else {
                 DispatchQueue.main.async {
-                    self?.errorMessage = "Could not auto-detect org ID — set it manually in the cookie panel"
+                    // Don't clobber a more specific "Session expired" message.
+                    if self?.sessionExpired != true {
+                        self?.errorMessage = "Could not auto-detect org ID — set it manually in the cookie panel"
+                    }
                     self?.isLoading = false
                 }
                 return
@@ -721,6 +752,8 @@ class UsageManager: ObservableObject {
 
                 if httpResponse.statusCode == 200, let data = data {
                     self?.parseUsageData(data)
+                } else if sessionLooksExpired(status: httpResponse.statusCode, accountIsNull: false) {
+                    self?.markSessionExpired()
                 } else {
                     self?.errorMessage = "HTTP \(httpResponse.statusCode)"
                 }
@@ -822,6 +855,7 @@ class UsageManager: ObservableObject {
 
             lastUpdated = Date()
             errorMessage = nil
+            sessionExpired = false
             hasFetchedData = true
 
             // Update percentage values for progress bars
@@ -1523,6 +1557,10 @@ struct UsageView: View {
                         }
                     }
                 }
+            }
+            .onChange(of: usageManager.sessionExpired) { expired in
+                // Surface the cookie field so re-pasting is one step away.
+                if expired { showingCookieInput = true }
             }
         }
     }

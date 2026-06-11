@@ -150,6 +150,24 @@ final class CredentialSession: NSObject, URLSessionTaskDelegate {
     }
 }
 
+/**
+ * Which usage thresholds to fire now and the new last-notified level, given the
+ * current %. Crossing up fires each newly-passed threshold; dropping below the
+ * last level re-arms it. Pure so it can be unit-tested.
+ */
+func thresholdsToFire(percent: Int, lastNotified: Int, thresholds: [Int] = [25, 50, 75, 90]) -> (fire: [Int], newLast: Int) {
+    var last = lastNotified
+    var fire: [Int] = []
+    for t in thresholds where percent >= t && last < t {
+        fire.append(t)
+        last = t
+    }
+    if percent < last {
+        last = thresholds.filter { $0 <= percent }.last ?? 0
+    }
+    return (fire, last)
+}
+
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -461,6 +479,10 @@ class UsageManager: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
     @Published var usageNotificationsEnabled: Bool = true
+    @Published var notifySession: Bool = true
+    @Published var notifyWeekly: Bool = true
+    @Published var notifySonnet: Bool = true
+    @Published var notifyDesign: Bool = true
     @Published var statusNotificationsEnabled: Bool = true
     @Published var openAtLogin: Bool = false
     @Published var hasWeeklySonnet: Bool = false
@@ -473,7 +495,8 @@ class UsageManager: ObservableObject {
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
     private weak var delegate: AppDelegate?
-    private var lastNotifiedThreshold: Int = 0
+    /** Per-window (session/weekly/sonnet/design) last-notified threshold level. */
+    private var notifiedThresholds: [String: Int] = [:]
 
     init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
         self.statusItem = statusItem
@@ -543,7 +566,12 @@ class UsageManager: ObservableObject {
 
         // Reflect the actual login-item registration, not a stored flag.
         openAtLogin = LoginItem.isEnabled
-        lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
+        notifiedThresholds = UserDefaults.standard.dictionary(forKey: "notified_thresholds") as? [String: Int] ?? [:]
+        // Per-window notification toggles default ON (the master gate already controls all).
+        notifySession = boolDefault("notify_session", true)
+        notifyWeekly  = boolDefault("notify_weekly",  true)
+        notifySonnet  = boolDefault("notify_sonnet",  true)
+        notifyDesign  = boolDefault("notify_design",  true)
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
             shortcutEnabled = true
@@ -553,8 +581,17 @@ class UsageManager: ObservableObject {
         showSessionTimeInMenuBar = UserDefaults.standard.bool(forKey: "show_session_time_in_menubar")
     }
 
+    /** UserDefaults bool that defaults to `fallback` when the key was never set. */
+    private func boolDefault(_ key: String, _ fallback: Bool) -> Bool {
+        UserDefaults.standard.object(forKey: key) == nil ? fallback : UserDefaults.standard.bool(forKey: key)
+    }
+
     func saveSettings() {
         UserDefaults.standard.set(usageNotificationsEnabled,  forKey: "usage_notifications_enabled")
+        UserDefaults.standard.set(notifySession, forKey: "notify_session")
+        UserDefaults.standard.set(notifyWeekly,  forKey: "notify_weekly")
+        UserDefaults.standard.set(notifySonnet,  forKey: "notify_sonnet")
+        UserDefaults.standard.set(notifyDesign,  forKey: "notify_design")
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
         UserDefaults.standard.set(showSessionTimeInMenuBar, forKey: "show_session_time_in_menubar")
@@ -593,8 +630,8 @@ class UsageManager: ObservableObject {
         hasWeeklySonnet = false
         hasWeeklyDesign = false
         errorMessage = nil
-        lastNotifiedThreshold = 0
-        UserDefaults.standard.set(0, forKey: "last_notified_threshold")
+        notifiedThresholds = [:]
+        UserDefaults.standard.removeObject(forKey: "notified_thresholds")
 
         // Update status bar to show 0%
         delegate?.updateStatusIcon(percentage: 0)
@@ -840,8 +877,8 @@ class UsageManager: ObservableObject {
         let timeRemaining = showSessionTimeInMenuBar ? formatTimeUntilReset(sessionResetsAt) : nil
         delegate?.updateStatusIcon(percentage: sessionPercent, timeRemaining: timeRemaining)
 
-        // Check for notification thresholds
-        checkNotificationThresholds(percentage: sessionPercent)
+        // Check for notification thresholds across all enabled windows
+        checkNotifications()
     }
 
     private func formatTimeUntilReset(_ resetsAt: Date?) -> String? {
@@ -859,34 +896,25 @@ class UsageManager: ObservableObject {
         }
     }
 
-    func checkNotificationThresholds(percentage: Int) {
-        NSLog("🔔 Checking notifications: percentage=\(percentage)%, enabled=\(usageNotificationsEnabled), lastNotified=\(lastNotifiedThreshold)%")
+    /** Fire threshold alerts for every enabled, present usage window. */
+    func checkNotifications() {
+        guard usageNotificationsEnabled else { return }
+        checkWindow("session", percent: sessionUsage,       enabled: notifySession, present: true,            label: "5-hour session")
+        checkWindow("weekly",  percent: weeklyUsage,        enabled: notifyWeekly,  present: true,            label: "7-day weekly")
+        checkWindow("sonnet",  percent: weeklySonnetUsage,  enabled: notifySonnet,  present: hasWeeklySonnet, label: "weekly Sonnet")
+        checkWindow("design",  percent: weeklyDesignUsage,  enabled: notifyDesign,  present: hasWeeklyDesign, label: "Claude Design")
+    }
 
-        guard usageNotificationsEnabled else {
-            NSLog("⚠️ Usage notifications disabled")
-            return
+    private func checkWindow(_ id: String, percent: Int, enabled: Bool, present: Bool, label: String) {
+        guard enabled, present else { return }
+        let last = notifiedThresholds[id] ?? 0
+        let result = thresholdsToFire(percent: percent, lastNotified: last)
+        for threshold in result.fire {
+            sendNotification(percentage: percent, threshold: threshold, windowLabel: label)
         }
-
-        let thresholds = [25, 50, 75, 90]
-
-        for threshold in thresholds {
-            if percentage >= threshold && lastNotifiedThreshold < threshold {
-                NSLog("📬 Sending notification for \(threshold)% threshold")
-                sendNotification(percentage: percentage, threshold: threshold)
-                lastNotifiedThreshold = threshold
-                // Persist the threshold
-                UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
-                UserDefaults.standard.synchronize()
-            }
-        }
-
-        // Reset if usage drops below current threshold
-        if percentage < lastNotifiedThreshold {
-            let newThreshold = thresholds.filter { $0 <= percentage }.last ?? 0
-            NSLog("🔄 Resetting notification threshold from \(lastNotifiedThreshold)% to \(newThreshold)%")
-            lastNotifiedThreshold = newThreshold
-            UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
-            UserDefaults.standard.synchronize()
+        if result.newLast != last {
+            notifiedThresholds[id] = result.newLast
+            UserDefaults.standard.set(notifiedThresholds, forKey: "notified_thresholds")
         }
     }
 
@@ -895,14 +923,14 @@ class UsageManager: ObservableObject {
      * authorization prompt for ad-hoc/from-source builds, whereas UNUserNotification
      * needs a properly signed, registered bundle. Revisit if this ships notarized.
      */
-    func sendNotification(percentage: Int, threshold: Int) {
+    func sendNotification(percentage: Int, threshold: Int, windowLabel: String) {
         let notification = NSUserNotification()
         notification.title = "Claude Usage Alert"
-        notification.informativeText = "You've reached \(percentage)% of your 5-hour session limit"
+        notification.informativeText = "You've reached \(percentage)% of your \(windowLabel) limit"
         notification.soundName = NSUserNotificationDefaultSoundName
 
         NSUserNotificationCenter.default.deliver(notification)
-        NSLog("📬 Sent notification for \(threshold)% threshold")
+        NSLog("📬 Sent \(windowLabel) notification for \(threshold)% threshold")
     }
 
     func sendTestNotification() {
@@ -1983,13 +2011,37 @@ struct UsageView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Enable Usage Notifications")
                                     .font(.caption)
-                                Text("Get alerts at 25%, 50%, 75%,\nand 90% session usage")
+                                Text("Alerts at 25 / 50 / 75 / 90% for the windows you pick below")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         }
                         .toggleStyle(.checkbox)
+
+                        // Which usage windows fire alerts (gated by the master toggle above).
+                        VStack(alignment: .leading, spacing: 4) {
+                            Toggle("Session (5-hour)", isOn: Binding(
+                                get: { usageManager.notifySession },
+                                set: { usageManager.notifySession = $0; usageManager.saveSettings() }))
+                            Toggle("Weekly (7-day)", isOn: Binding(
+                                get: { usageManager.notifyWeekly },
+                                set: { usageManager.notifyWeekly = $0; usageManager.saveSettings() }))
+                            if usageManager.hasWeeklySonnet {
+                                Toggle("Weekly Sonnet", isOn: Binding(
+                                    get: { usageManager.notifySonnet },
+                                    set: { usageManager.notifySonnet = $0; usageManager.saveSettings() }))
+                            }
+                            if usageManager.hasWeeklyDesign {
+                                Toggle("Claude Design", isOn: Binding(
+                                    get: { usageManager.notifyDesign },
+                                    set: { usageManager.notifyDesign = $0; usageManager.saveSettings() }))
+                            }
+                        }
+                        .font(.caption2)
+                        .toggleStyle(.checkbox)
+                        .padding(.leading, 16)
+                        .disabled(!usageManager.usageNotificationsEnabled)
 
                         Toggle(isOn: Binding(
                             get: { usageManager.statusNotificationsEnabled },

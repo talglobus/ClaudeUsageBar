@@ -161,6 +161,12 @@ func sessionLooksExpired(status: Int, accountIsNull: Bool) -> Bool {
     return false
 }
 
+/** Clamp a utilization value to a 0–100 Int; non-finite (NaN / ∞) maps to 0 so `Int()` can't trap. */
+func clampedPercent(_ value: Double) -> Int {
+    guard value.isFinite else { return 0 }
+    return Int(min(max(value, 0), 100))
+}
+
 /**
  * Composes the menu-bar title: the session %, an optional time-left segment,
  * and an optional weekly %. Pure so it can be unit-tested.
@@ -837,7 +843,7 @@ class UsageManager: ObservableObject {
             // Parse the actual claude.ai response format
             if let fiveHour = json["five_hour"] as? [String: Any] {
                 if let sessionUtil = fiveHour["utilization"] as? Double {
-                    sessionUsage = Int(sessionUtil)
+                    sessionUsage = clampedPercent(sessionUtil)
                     sessionLimit = 100
                 }
                 if let resetsAtString = fiveHour["resets_at"] as? String {
@@ -853,7 +859,7 @@ class UsageManager: ObservableObject {
 
             if let sevenDay = json["seven_day"] as? [String: Any] {
                 if let weeklyUtil = sevenDay["utilization"] as? Double {
-                    weeklyUsage = Int(weeklyUtil)
+                    weeklyUsage = clampedPercent(weeklyUtil)
                     weeklyLimit = 100
                 }
                 if let resetsAtString = sevenDay["resets_at"] as? String {
@@ -871,7 +877,7 @@ class UsageManager: ObservableObject {
             if let sevenDaySonnet = json["seven_day_sonnet"] as? [String: Any] {
                 hasWeeklySonnet = true
                 if let sonnetUtil = sevenDaySonnet["utilization"] as? Double {
-                    weeklySonnetUsage = Int(sonnetUtil)
+                    weeklySonnetUsage = clampedPercent(sonnetUtil)
                     weeklySonnetLimit = 100
                 }
                 if let resetsAtString = sevenDaySonnet["resets_at"] as? String {
@@ -895,7 +901,7 @@ class UsageManager: ObservableObject {
             if let sevenDayDesign = json["seven_day_omelette"] as? [String: Any] {
                 hasWeeklyDesign = true
                 if let designUtil = sevenDayDesign["utilization"] as? Double {
-                    weeklyDesignUsage = Int(designUtil)
+                    weeklyDesignUsage = clampedPercent(designUtil)
                     weeklyDesignLimit = 100
                 }
                 if let resetsAtString = sevenDayDesign["resets_at"] as? String,

@@ -42,6 +42,11 @@ func sessionLooksExpired(status: Int, accountIsNull: Bool) -> Bool {
     return false
 }
 
+func clampedPercent(_ value: Double) -> Int {
+    guard value.isFinite else { return 0 }
+    return Int(min(max(value, 0), 100))
+}
+
 // MARK: - Assertions
 
 var failures = 0
@@ -94,6 +99,14 @@ eqBool("200 + real account", sessionLooksExpired(status: 200, accountIsNull: fal
 eqBool("500 not expired",    sessionLooksExpired(status: 500, accountIsNull: false), false)
 eqBool("0 not expired",      sessionLooksExpired(status: 0,   accountIsNull: false), false)
 eqBool("500 + null account", sessionLooksExpired(status: 500, accountIsNull: true),  false)
+
+// MARK: - NaN-safe utilization clamping
+
+eqInt("clamp normal",    clampedPercent(42.7), 42)
+eqInt("clamp NaN",       clampedPercent(Double.nan), 0)
+eqInt("clamp +inf → 0",  clampedPercent(Double.infinity), 0)
+eqInt("clamp negative",  clampedPercent(-5), 0)
+eqInt("clamp over 100",  clampedPercent(150), 100)
 
 print("\n\(failures == 0 ? "ALL PASS" : "\(failures) FAILURE(S)")")
 exit(failures == 0 ? 0 : 1)

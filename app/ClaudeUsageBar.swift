@@ -150,6 +150,23 @@ final class CredentialSession: NSObject, URLSessionTaskDelegate {
     }
 }
 
+/**
+ * Composes the menu-bar title: the session %, an optional time-left segment,
+ * and an optional weekly %. Pure so it can be unit-tested.
+ */
+func menuBarTitle(sessionPercent: Int, timeRemaining: String?, weeklyPercent: Int?) -> String {
+    var title = " \(sessionPercent)%"
+    if let timeRemaining = timeRemaining { title += " · \(timeRemaining)" }
+    if let weeklyPercent = weeklyPercent { title += " / \(weeklyPercent)%" }
+    return title
+}
+
+/** The percentage the badge color tracks: the worse of session/weekly when weekly is shown. */
+func menuBarBadgeBasis(sessionPercent: Int, weeklyPercent: Int?) -> Int {
+    guard let weeklyPercent = weeklyPercent else { return sessionPercent }
+    return max(sessionPercent, weeklyPercent)
+}
+
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -371,14 +388,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func updateStatusIcon(percentage: Int, timeRemaining: String? = nil) {
+    func updateStatusIcon(percentage: Int, timeRemaining: String? = nil, weeklyPercent: Int? = nil) {
         guard let button = statusItem.button else { return }
 
-        // Determine color based on percentage
+        // Color tracks whichever shown window is closest to its limit.
+        let basis = menuBarBadgeBasis(sessionPercent: percentage, weeklyPercent: weeklyPercent)
         let color: NSColor
-        if percentage < 70 {
+        if basis < 70 {
             color = NSColor(red: 0.13, green: 0.77, blue: 0.37, alpha: 1.0) // Green
-        } else if percentage < 90 {
+        } else if basis < 90 {
             color = NSColor(red: 1.0, green: 0.8, blue: 0.0, alpha: 1.0) // Yellow
         } else {
             color = NSColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1.0) // Red
@@ -389,11 +407,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set image and title
         button.image = sparkIcon
-        if let timeRemaining = timeRemaining {
-            button.title = " \(percentage)% · \(timeRemaining)"
-        } else {
-            button.title = " \(percentage)%"
-        }
+        button.title = menuBarTitle(sessionPercent: percentage, timeRemaining: timeRemaining, weeklyPercent: weeklyPercent)
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -468,6 +482,7 @@ class UsageManager: ObservableObject {
     @Published var hasFetchedData: Bool = false
     @Published var shortcutEnabled: Bool = true
     @Published var showSessionTimeInMenuBar: Bool = false
+    @Published var showWeeklyInMenuBar: Bool = false
     @Published var organizationId: String = ""
 
     private var statusItem: NSStatusItem?
@@ -551,6 +566,7 @@ class UsageManager: ObservableObject {
             shortcutEnabled = UserDefaults.standard.bool(forKey: "shortcut_enabled")
         }
         showSessionTimeInMenuBar = UserDefaults.standard.bool(forKey: "show_session_time_in_menubar")
+        showWeeklyInMenuBar = UserDefaults.standard.bool(forKey: "show_weekly_in_menubar")
     }
 
     func saveSettings() {
@@ -558,6 +574,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
         UserDefaults.standard.set(showSessionTimeInMenuBar, forKey: "show_session_time_in_menubar")
+        UserDefaults.standard.set(showWeeklyInMenuBar, forKey: "show_weekly_in_menubar")
         UserDefaults.standard.synchronize()
     }
 
@@ -836,9 +853,10 @@ class UsageManager: ObservableObject {
         // The API returns `utilization` already as a 0–100 percentage.
         let sessionPercent = sessionUsage
 
-        // Update the icon color (and optionally the time until the session resets).
+        // Update the icon color (and optionally the time-left / weekly % segments).
         let timeRemaining = showSessionTimeInMenuBar ? formatTimeUntilReset(sessionResetsAt) : nil
-        delegate?.updateStatusIcon(percentage: sessionPercent, timeRemaining: timeRemaining)
+        let weeklyPercent = showWeeklyInMenuBar ? weeklyUsage : nil
+        delegate?.updateStatusIcon(percentage: sessionPercent, timeRemaining: timeRemaining, weeklyPercent: weeklyPercent)
 
         // Check for notification thresholds
         checkNotificationThresholds(percentage: sessionPercent)
@@ -1965,6 +1983,25 @@ struct UsageView: View {
                             Text("Show Session Time in Menu Bar")
                                 .font(.caption)
                             Text("Display time remaining until the 5-hour session resets, next to the usage percentage")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+
+                    Toggle(isOn: Binding(
+                        get: { usageManager.showWeeklyInMenuBar },
+                        set: { newValue in
+                            usageManager.showWeeklyInMenuBar = newValue
+                            usageManager.saveSettings()
+                            usageManager.updateStatusBar()
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Show Weekly % in Menu Bar")
+                                .font(.caption)
+                            Text("Add the 7-day weekly usage after the session %; the icon color then reflects whichever is closer to its limit")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)

@@ -150,6 +150,11 @@ final class CredentialSession: NSObject, URLSessionTaskDelegate {
     }
 }
 
+/** The highest threshold the current % has reached (0 if below the lowest). Pure. */
+func thresholdBucket(percent: Int, thresholds: [Int] = [25, 50, 75, 90]) -> Int {
+    thresholds.filter { $0 <= percent }.last ?? 0
+}
+
 /**
  * Which usage thresholds to fire now and the new last-notified level, given the
  * current %. Crossing up fires each newly-passed threshold; dropping below the
@@ -163,7 +168,7 @@ func thresholdsToFire(percent: Int, lastNotified: Int, thresholds: [Int] = [25, 
         last = t
     }
     if percent < last {
-        last = thresholds.filter { $0 <= percent }.last ?? 0
+        last = thresholdBucket(percent: percent, thresholds: thresholds)
     }
     return (fire, last)
 }
@@ -863,6 +868,8 @@ class UsageManager: ObservableObject {
 
             // Update percentage values for progress bars
             updatePercentages()
+            // Evaluate notification thresholds only on fresh, successful data.
+            checkNotifications()
         } catch {
             NSLog("❌ Parse error: \(error.localizedDescription)")
             errorMessage = "Parse error"
@@ -876,9 +883,6 @@ class UsageManager: ObservableObject {
         // Update the icon color (and optionally the time until the session resets).
         let timeRemaining = showSessionTimeInMenuBar ? formatTimeUntilReset(sessionResetsAt) : nil
         delegate?.updateStatusIcon(percentage: sessionPercent, timeRemaining: timeRemaining)
-
-        // Check for notification thresholds across all enabled windows
-        checkNotifications()
     }
 
     private func formatTimeUntilReset(_ resetsAt: Date?) -> String? {
@@ -907,7 +911,13 @@ class UsageManager: ObservableObject {
 
     private func checkWindow(_ id: String, percent: Int, enabled: Bool, present: Bool, label: String) {
         guard enabled, present else { return }
-        let last = notifiedThresholds[id] ?? 0
+        // First time we see this window, baseline to its current level and fire
+        // nothing — otherwise pre-existing usage would emit a retroactive burst.
+        guard let last = notifiedThresholds[id] else {
+            notifiedThresholds[id] = thresholdBucket(percent: percent)
+            UserDefaults.standard.set(notifiedThresholds, forKey: "notified_thresholds")
+            return
+        }
         let result = thresholdsToFire(percent: percent, lastNotified: last)
         for threshold in result.fire {
             sendNotification(percentage: percent, threshold: threshold, windowLabel: label)
